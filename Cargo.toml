@@ -23,6 +23,7 @@ thiserror = "2.0"
 hmac = "0.13.0"
 
 [dev-dependencies]
+cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time"] }
 bytes = "1.12"
 
