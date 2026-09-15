@@ -16,7 +16,7 @@ armature-core = { version = "0.9" }
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-regex = "1.12"
+regex = "1.13"
 sha2 = "0.11"
 hex = "0.4"
 thiserror = "2.0"
@@ -24,6 +24,6 @@ hmac = "0.13.0"
 
 [dev-dependencies]
 cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
 bytes = "1.12"
 
