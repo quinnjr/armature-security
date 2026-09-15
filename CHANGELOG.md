@@ -9,17 +9,12 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
-### Fixed
+## [0.4.0] - 2026-09-15
 
-- **Breaking:** `allow_credentials(true)` now clears `allow_any_origin` (and vice versa), and the preflight/apply paths refuse to emit an origin at all if the combination is somehow reached. Previously the two could be set together and any attacker origin was reflected alongside `Access-Control-Allow-Credentials: true` — the doc forbade the pairing, nothing enforced it, and `permissive().allow_credentials(true)` reached it in two calls.
-- Request-signature verification no longer skips on a `starts_with` prefix of the raw target. `should_skip` matches whole segments of `path_only()` and rejects dot segments, so `/health../admin` and `/healthcheck-admin` no longer bypass verification.
-- A signature timestamped in the future is rejected rather than treated as infinitely fresh; `saturating_sub` had clamped the age to zero.
-- A disallowed preflight method returns `Forbidden` instead of a 204 with the header quietly omitted, and `Vary` is appended rather than overwritten.
+### Changed
 
-### Changed — `0.1.3` → `0.1.4`
-
-- Migrated onto `armature-core` `0.8`'s `Bytes`-backed request and response types. No behavior change beyond what that migration implies; see [`armature-core/CHANGELOG.md`](../armature-core/CHANGELOG.md).
-- Request-signature verification reads the method through `method_str()`; signatures are unchanged.
+- **Breaking:** requires `armature-core` 0.10 (was `0.9`); its types appear in this crate's API, so the requirement change is breaking here and the minor moves. Part of the `armature-core` 0.10 release train.
+- Dependencies bumped to their latest releases: `regex` 1.12 → 1.13, `tokio` 1.52 → 1.53.
 
 ## [0.3.0] - 2026-08-05
 
