@@ -149,16 +149,32 @@ impl CorsConfig {
 
     /// Allow origins matching regex pattern
     ///
+    /// The pattern must match the **whole** `Origin` value: it is compiled as
+    /// `^(?:pattern)$`, so an unanchored pattern cannot be satisfied by a
+    /// substring of an attacker-controlled origin (for example
+    /// `https://a.example.com.attacker.net` against `https://.*\.example\.com`).
+    /// Even anchored, `.` and `.*` match across host labels and into a path
+    /// component, so write patterns that only admit a single DNS label where
+    /// you mean a subdomain, and escape literal dots.
+    ///
+    /// The opaque origin `null` is never matched by a pattern.
+    ///
     /// # Examples
     ///
     /// ```
     /// use armature_security::cors::CorsConfig;
     ///
+    /// // One DNS label, then the literal registrable domain.
     /// let cors = CorsConfig::new()
-    ///     .allow_origin_regex(r"https://.*\.example\.com").unwrap();
+    ///     .allow_origin_regex(r"https://[a-z0-9-]+\.example\.com")
+    ///     .unwrap();
+    ///
+    /// assert!(cors.is_origin_allowed("https://app.example.com"));
+    /// assert!(!cors.is_origin_allowed("https://a.example.com.attacker.net"));
+    /// assert!(!cors.is_origin_allowed("https://evil.com/.example.com"));
     /// ```
     pub fn allow_origin_regex(mut self, pattern: &str) -> Result<Self, regex::Error> {
-        let regex = Regex::new(pattern)?;
+        let regex = Regex::new(&format!("^(?:{})$", pattern))?;
         self.origin_patterns.push(regex);
         Ok(self)
     }
@@ -299,10 +315,19 @@ impl CorsConfig {
     }
 
     /// Check if origin is allowed
+    ///
+    /// The opaque origin `null` (sandboxed iframes, `file:` pages, some
+    /// redirects) is shared by every such document, so it is never allowed by
+    /// an allowlist or pattern; only the wildcard policy, which answers `*`
+    /// rather than reflecting the value, accepts it.
     pub fn is_origin_allowed(&self, origin: &str) -> bool {
         // Allow any origin
         if self.allow_any_origin {
             return true;
+        }
+
+        if origin.eq_ignore_ascii_case("null") {
+            return false;
         }
 
         // Check exact match
@@ -526,6 +551,55 @@ mod tests {
         assert!(cors.is_origin_allowed("https://api.example.com"));
         assert!(!cors.is_origin_allowed("https://example.com"));
         assert!(!cors.is_origin_allowed("https://evil.com"));
+    }
+
+    #[test]
+    fn origin_regex_is_anchored() {
+        // The pattern documented before the fix: unanchored, it matched any
+        // origin that merely *contained* a subdomain of example.com.
+        let cors = CorsConfig::new()
+            .allow_origin_regex(r"https://.*\.example\.com")
+            .unwrap();
+
+        assert!(cors.is_origin_allowed("https://app.example.com"));
+        assert!(!cors.is_origin_allowed("https://a.example.com.attacker.net"));
+        assert!(!cors.is_origin_allowed("xhttps://a.example.com"));
+        assert!(!cors.is_origin_allowed("null"));
+
+        // Alternation must not escape the anchors.
+        let cors = CorsConfig::new()
+            .allow_origin_regex(r"https://a\.example\.com|https://b\.example\.com")
+            .unwrap();
+        assert!(cors.is_origin_allowed("https://b.example.com"));
+        assert!(!cors.is_origin_allowed("https://b.example.com.attacker.net"));
+        assert!(!cors.is_origin_allowed("https://evil.com/https://a.example.com"));
+    }
+
+    #[test]
+    fn label_restricted_pattern_rejects_path_tricks() {
+        let cors = CorsConfig::new()
+            .allow_origin_regex(r"https://[a-z0-9-]+\.example\.com")
+            .unwrap();
+
+        assert!(cors.is_origin_allowed("https://api.example.com"));
+        assert!(!cors.is_origin_allowed("https://evil.com/.example.com"));
+        assert!(!cors.is_origin_allowed("https://a.example.com.attacker.net"));
+        assert!(!cors.is_origin_allowed("https://a.b.example.com"));
+    }
+
+    #[test]
+    fn null_origin_is_never_reflected() {
+        let cors = CorsConfig::new()
+            .allow_origin("null")
+            .allow_origin_regex(".*")
+            .unwrap()
+            .allow_credentials(true);
+
+        assert!(!cors.is_origin_allowed("null"));
+
+        let mut response = HttpResponse::ok();
+        cors.add_cors_headers(&mut response, "null");
+        assert_eq!(response.headers.get("Access-Control-Allow-Origin"), None);
     }
 
     #[test]

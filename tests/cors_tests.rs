@@ -35,7 +35,7 @@ fn test_cors_multiple_origins() {
 #[test]
 fn test_cors_origin_regex() {
     let cors = CorsConfig::new()
-        .allow_origin_regex(r"https://.*\.example\.com")
+        .allow_origin_regex(r"https://[a-z0-9-]+\.example\.com")
         .unwrap();
 
     assert!(cors.is_origin_allowed("https://app.example.com"));
@@ -43,6 +43,10 @@ fn test_cors_origin_regex() {
     assert!(cors.is_origin_allowed("https://admin.example.com"));
     assert!(!cors.is_origin_allowed("https://example.com")); // No subdomain
     assert!(!cors.is_origin_allowed("https://evil.com"));
+    // Substring and path tricks that an unanchored pattern accepted.
+    assert!(!cors.is_origin_allowed("https://a.example.com.attacker.net"));
+    assert!(!cors.is_origin_allowed("https://evil.com/.example.com"));
+    assert!(!cors.is_origin_allowed("null"));
 }
 
 #[test]
