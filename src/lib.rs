@@ -59,10 +59,30 @@
 //!     .script_src(vec!["'self'".to_string(), "'unsafe-inline'".to_string()])
 //!     .style_src(vec!["'self'".to_string(), "https://fonts.googleapis.com".to_string()]);
 //!
-//! let security = SecurityMiddleware::new().with_csp(csp);
+//! // Directive values are validated: `;`, `,`, whitespace and CR/LF are rejected.
+//! let security = SecurityMiddleware::new().with_csp(csp).unwrap();
 //! let response = security.apply(armature_core::HttpResponse::ok());
 //!
 //! assert!(response.headers.contains_key("Content-Security-Policy"));
+//! ```
+//!
+//! ## Handler-set headers win
+//!
+//! [`SecurityMiddleware::apply`] only fills in a security header the response
+//! does not already carry (compared case-insensitively), so a handler that sets
+//! its own, stricter or route-specific, policy keeps it.
+//!
+//! ```
+//! use armature_security::SecurityMiddleware;
+//!
+//! let mut response = armature_core::HttpResponse::ok();
+//! response
+//!     .headers
+//!     .insert("x-frame-options".to_string(), "SAMEORIGIN".to_string());
+//! let response = SecurityMiddleware::default().apply(response);
+//!
+//! assert_eq!(response.headers.get("x-frame-options"), Some(&"SAMEORIGIN".to_string()));
+//! assert!(!response.headers.contains_key("X-Frame-Options"));
 //! ```
 //!
 //! ## HSTS (HTTP Strict Transport Security)
@@ -108,11 +128,14 @@
 pub mod content_security_policy;
 pub mod content_type_options;
 pub mod cors;
+pub mod cross_origin;
+pub mod csrf;
 pub mod dns_prefetch_control;
 pub mod download_options;
 pub mod expect_ct;
 pub mod frame_guard;
 pub mod hsts;
+pub mod permissions_policy;
 pub mod permitted_cross_domain_policies;
 pub mod powered_by;
 pub mod referrer_policy;
@@ -158,17 +181,61 @@ pub struct SecurityMiddleware {
     /// X-Permitted-Cross-Domain-Policies
     pub permitted_cross_domain_policies:
         permitted_cross_domain_policies::PermittedCrossDomainPolicies,
+
+    /// Cross-Origin-Opener-Policy (`None` = not sent)
+    pub cross_origin_opener_policy: Option<cross_origin::CrossOriginOpenerPolicy>,
+
+    /// Cross-Origin-Resource-Policy (`None` = not sent)
+    pub cross_origin_resource_policy: Option<cross_origin::CrossOriginResourcePolicy>,
+
+    /// Permissions-Policy (`None` = not sent)
+    pub permissions_policy: Option<permissions_policy::PermissionsPolicy>,
+}
+
+/// Header value sent when a [`content_security_policy::CspConfig`] that fails
+/// validation reaches [`SecurityMiddleware::apply`] (only possible by writing
+/// the public `csp` field directly): block everything rather than emit an
+/// injectable policy or none at all.
+const FAIL_CLOSED_CSP: &str = "default-src 'none'; frame-ancestors 'none'";
+
+/// Insert `name: value` unless the response already has `name` under any
+/// letter case.
+fn set_if_absent(response: &mut HttpResponse, name: &str, value: String) {
+    let present = response
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case(name));
+    if !present {
+        response.headers.insert(name.to_string(), value);
+    }
+}
+
+/// Remove every spelling of `name` from the response headers.
+fn remove_all_cases(response: &mut HttpResponse, name: &str) {
+    let keys: Vec<String> = response
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in keys {
+        response.headers.remove(&key);
+    }
 }
 
 impl SecurityMiddleware {
     /// Create a new security middleware with the always-safe headers enabled
     ///
     /// `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
-    /// `X-Content-Type-Options: nosniff`, `X-Download-Options: noopen` and
-    /// `X-Permitted-Cross-Domain-Policies: none` are on, since none of them can
-    /// break an application. The headers that need per-deployment tuning — CSP,
-    /// HSTS and Expect-CT — are off until configured, as is the legacy XSS
-    /// auditor.
+    /// `X-Content-Type-Options: nosniff`, `X-Download-Options: noopen`,
+    /// `X-Permitted-Cross-Domain-Policies: none`,
+    /// `Cross-Origin-Opener-Policy: same-origin`,
+    /// `Cross-Origin-Resource-Policy: same-origin` and a restrictive
+    /// `Permissions-Policy` are on. Relax COOP/CORP with
+    /// [`with_coop`](Self::with_coop) / [`with_corp`](Self::with_corp) if the
+    /// application relies on cross-origin popups or serves embeddable assets.
+    /// The headers that need per-deployment tuning — CSP, HSTS and Expect-CT —
+    /// are off until configured, as is the legacy XSS auditor.
     pub fn new() -> Self {
         Self {
             csp: None,
@@ -186,12 +253,45 @@ impl SecurityMiddleware {
             download_options: download_options::DownloadOptions::NoOpen,
             permitted_cross_domain_policies:
                 permitted_cross_domain_policies::PermittedCrossDomainPolicies::None,
+            cross_origin_opener_policy: Some(cross_origin::CrossOriginOpenerPolicy::SameOrigin),
+            cross_origin_resource_policy: Some(cross_origin::CrossOriginResourcePolicy::SameOrigin),
+            permissions_policy: Some(permissions_policy::PermissionsPolicy::restrictive()),
         }
     }
 
     /// Enable Content Security Policy
-    pub fn with_csp(mut self, config: content_security_policy::CspConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`content_security_policy::CspError`] if a directive name or value
+    /// could inject into the header (`;`, `,`, whitespace, CR/LF).
+    pub fn with_csp(
+        mut self,
+        config: content_security_policy::CspConfig,
+    ) -> Result<Self, content_security_policy::CspError> {
+        config.validate()?;
         self.csp = Some(config);
+        Ok(self)
+    }
+
+    /// Set or disable (`None`) `Cross-Origin-Opener-Policy`
+    pub fn with_coop(mut self, policy: Option<cross_origin::CrossOriginOpenerPolicy>) -> Self {
+        self.cross_origin_opener_policy = policy;
+        self
+    }
+
+    /// Set or disable (`None`) `Cross-Origin-Resource-Policy`
+    pub fn with_corp(mut self, policy: Option<cross_origin::CrossOriginResourcePolicy>) -> Self {
+        self.cross_origin_resource_policy = policy;
+        self
+    }
+
+    /// Set or disable (`None`) `Permissions-Policy`
+    pub fn with_permissions_policy(
+        mut self,
+        policy: Option<permissions_policy::PermissionsPolicy>,
+    ) -> Self {
+        self.permissions_policy = policy;
         self
     }
 
@@ -242,6 +342,9 @@ impl SecurityMiddleware {
     }
 
     /// Apply security headers to a response
+    ///
+    /// A header the response already carries — under any letter case — is
+    /// left as the handler set it; only missing headers are added.
     pub fn apply(&self, mut response: HttpResponse) -> HttpResponse {
         // Content Security Policy
         if let Some(ref csp) = self.csp {
@@ -250,71 +353,95 @@ impl SecurityMiddleware {
             } else {
                 "Content-Security-Policy"
             };
-            response
-                .headers
-                .insert(header_name.to_string(), csp.to_header_value());
+            let value = csp
+                .to_header_value()
+                .unwrap_or_else(|_| FAIL_CLOSED_CSP.to_string());
+            set_if_absent(&mut response, header_name, value);
         }
 
-        // DNS Prefetch Control
-        response.headers.insert(
-            "X-DNS-Prefetch-Control".to_string(),
+        set_if_absent(
+            &mut response,
+            "X-DNS-Prefetch-Control",
             self.dns_prefetch_control.to_header_value(),
         );
 
-        // Expect-CT
         if let Some(ref expect_ct) = self.expect_ct {
-            response
-                .headers
-                .insert("Expect-CT".to_string(), expect_ct.to_header_value());
+            set_if_absent(&mut response, "Expect-CT", expect_ct.to_header_value());
         }
 
-        // Frame Guard
-        response.headers.insert(
-            "X-Frame-Options".to_string(),
+        set_if_absent(
+            &mut response,
+            "X-Frame-Options",
             self.frame_guard.to_header_value(),
         );
 
-        // HSTS
         if let Some(ref hsts) = self.hsts {
-            response.headers.insert(
-                "Strict-Transport-Security".to_string(),
+            set_if_absent(
+                &mut response,
+                "Strict-Transport-Security",
                 hsts.to_header_value(),
             );
         }
 
-        // Referrer Policy
-        response.headers.insert(
-            "Referrer-Policy".to_string(),
+        set_if_absent(
+            &mut response,
+            "Referrer-Policy",
             self.referrer_policy.to_header_value(),
         );
 
-        // XSS Filter
-        response.headers.insert(
-            "X-XSS-Protection".to_string(),
+        set_if_absent(
+            &mut response,
+            "X-XSS-Protection",
             self.xss_filter.to_header_value(),
         );
 
-        // Content Type Options
-        response.headers.insert(
-            "X-Content-Type-Options".to_string(),
+        set_if_absent(
+            &mut response,
+            "X-Content-Type-Options",
             self.content_type_options.to_header_value(),
         );
 
-        // Download Options
-        response.headers.insert(
-            "X-Download-Options".to_string(),
+        set_if_absent(
+            &mut response,
+            "X-Download-Options",
             self.download_options.to_header_value(),
         );
 
-        // Permitted Cross Domain Policies
-        response.headers.insert(
-            "X-Permitted-Cross-Domain-Policies".to_string(),
+        set_if_absent(
+            &mut response,
+            "X-Permitted-Cross-Domain-Policies",
             self.permitted_cross_domain_policies.to_header_value(),
         );
 
-        // Remove X-Powered-By if requested
+        if let Some(coop) = self.cross_origin_opener_policy {
+            set_if_absent(
+                &mut response,
+                "Cross-Origin-Opener-Policy",
+                coop.to_header_value(),
+            );
+        }
+
+        if let Some(corp) = self.cross_origin_resource_policy {
+            set_if_absent(
+                &mut response,
+                "Cross-Origin-Resource-Policy",
+                corp.to_header_value(),
+            );
+        }
+
+        if let Some(ref policy) = self.permissions_policy
+            && !policy.is_empty()
+        {
+            set_if_absent(
+                &mut response,
+                "Permissions-Policy",
+                policy.to_header_value(),
+            );
+        }
+
+        // Remove X-Powered-By (every spelling) if requested
         if self.hide_powered_by {
-            response.headers.remove("X-Powered-By");
+            remove_all_cases(&mut response, "X-Powered-By");
         }
 
         response
@@ -341,6 +468,9 @@ impl SecurityMiddleware {
             download_options: download_options::DownloadOptions::NoOpen,
             permitted_cross_domain_policies:
                 permitted_cross_domain_policies::PermittedCrossDomainPolicies::None,
+            cross_origin_opener_policy: Some(cross_origin::CrossOriginOpenerPolicy::SameOrigin),
+            cross_origin_resource_policy: Some(cross_origin::CrossOriginResourcePolicy::SameOrigin),
+            permissions_policy: Some(permissions_policy::PermissionsPolicy::restrictive()),
         }
     }
 }
@@ -360,6 +490,7 @@ pub mod prelude {
     pub use crate::SecurityMiddleware;
     pub use crate::content_security_policy::CspConfig;
     pub use crate::cors::CorsConfig;
+    pub use crate::csrf::{CsrfConfig, CsrfMiddleware, CsrfProtection};
     pub use crate::frame_guard::FrameGuard;
     pub use crate::hsts::HstsConfig;
     pub use crate::referrer_policy::ReferrerPolicy;
@@ -459,8 +590,9 @@ mod tests {
     #[test]
     fn test_csp_header_name_depends_on_report_only() {
         // Enforcing CSP uses the standard header name.
-        let enforcing =
-            SecurityMiddleware::new().with_csp(content_security_policy::CspConfig::default());
+        let enforcing = SecurityMiddleware::new()
+            .with_csp(content_security_policy::CspConfig::default())
+            .unwrap();
         let secured = enforcing.apply(HttpResponse::ok());
         assert!(secured.headers.contains_key("Content-Security-Policy"));
         assert!(
@@ -471,7 +603,8 @@ mod tests {
 
         // report_only(true) must emit the header under the Report-Only name instead.
         let report_only = SecurityMiddleware::new()
-            .with_csp(content_security_policy::CspConfig::default().report_only(true));
+            .with_csp(content_security_policy::CspConfig::default().report_only(true))
+            .unwrap();
         let secured = report_only.apply(HttpResponse::ok());
         assert!(
             secured
@@ -511,5 +644,102 @@ mod tests {
             secured.headers.get("Referrer-Policy"),
             Some(&"strict-origin-when-cross-origin".to_string())
         );
+    }
+
+    #[test]
+    fn default_emits_isolation_headers() {
+        let secured = SecurityMiddleware::default().apply(HttpResponse::ok());
+        assert_eq!(
+            secured.headers.get("Cross-Origin-Opener-Policy"),
+            Some(&"same-origin".to_string())
+        );
+        assert_eq!(
+            secured.headers.get("Cross-Origin-Resource-Policy"),
+            Some(&"same-origin".to_string())
+        );
+        assert!(
+            secured
+                .headers
+                .get("Permissions-Policy")
+                .unwrap()
+                .contains("camera=()")
+        );
+    }
+
+    #[test]
+    fn isolation_headers_are_configurable() {
+        let secured = SecurityMiddleware::default()
+            .with_coop(Some(
+                cross_origin::CrossOriginOpenerPolicy::SameOriginAllowPopups,
+            ))
+            .with_corp(None)
+            .with_permissions_policy(None)
+            .apply(HttpResponse::ok());
+        assert_eq!(
+            secured.headers.get("Cross-Origin-Opener-Policy"),
+            Some(&"same-origin-allow-popups".to_string())
+        );
+        assert!(!secured.headers.contains_key("Cross-Origin-Resource-Policy"));
+        assert!(!secured.headers.contains_key("Permissions-Policy"));
+    }
+
+    #[test]
+    fn apply_does_not_clobber_handler_headers() {
+        // A handler that sets its own (possibly route-specific) policy, in any
+        // letter case, must keep it; the middleware used to overwrite it and,
+        // for a different case, emit a conflicting duplicate.
+        let mut response = HttpResponse::ok();
+        response.headers.insert(
+            "content-security-policy".to_string(),
+            "default-src 'none'".to_string(),
+        );
+        response
+            .headers
+            .insert("X-Frame-Options".to_string(), "SAMEORIGIN".to_string());
+
+        let secured = SecurityMiddleware::default().apply(response);
+
+        assert_eq!(
+            secured.headers.get("content-security-policy"),
+            Some(&"default-src 'none'".to_string())
+        );
+        assert!(!secured.headers.contains_key("Content-Security-Policy"));
+        assert_eq!(
+            secured.headers.get("X-Frame-Options"),
+            Some(&"SAMEORIGIN".to_string())
+        );
+    }
+
+    #[test]
+    fn with_csp_rejects_injection() {
+        let csp = content_security_policy::CspConfig::new()
+            .script_src(vec!["'self'; script-src *".to_string()]);
+        assert!(SecurityMiddleware::new().with_csp(csp).is_err());
+    }
+
+    #[test]
+    fn invalid_csp_set_directly_fails_closed() {
+        let mut middleware = SecurityMiddleware::new();
+        middleware.csp = Some(
+            content_security_policy::CspConfig::new()
+                .script_src(vec!["*\r\nSet-Cookie: a=b".to_string()]),
+        );
+        let secured = middleware.apply(HttpResponse::ok());
+        assert_eq!(
+            secured.headers.get("Content-Security-Policy"),
+            Some(&FAIL_CLOSED_CSP.to_string())
+        );
+    }
+
+    #[test]
+    fn hide_powered_by_is_case_insensitive() {
+        let mut response = HttpResponse::ok();
+        response
+            .headers
+            .insert("x-powered-by".to_string(), "Armature".to_string());
+        let secured = SecurityMiddleware::new()
+            .hide_powered_by(true)
+            .apply(response);
+        assert!(!secured.headers.contains_key("x-powered-by"));
     }
 }
