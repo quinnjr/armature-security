@@ -73,7 +73,7 @@ fn test_csp_config() {
         .script_src(vec!["'self'".to_string(), "'unsafe-inline'".to_string()])
         .style_src(vec!["'self'".to_string()]);
 
-    let header = csp.to_header_value();
+    let header = csp.to_header_value().unwrap();
     assert!(header.contains("default-src 'self'"));
     assert!(header.contains("script-src 'self' 'unsafe-inline'"));
 }
