@@ -21,6 +21,8 @@ sha2 = "0.11"
 hex = "0.4"
 thiserror = "2.0"
 hmac = "0.13.0"
+# CSPRNG for CSRF cookie nonces.
+getrandom = "0.4"
 
 [dev-dependencies]
 cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
