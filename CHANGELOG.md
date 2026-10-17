@@ -9,6 +9,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-17
+
 ### Security
 
 - **CORS regex origins are anchored.** `CorsConfig::allow_origin_regex` compiles the pattern as `^(?:pattern)$`; previously it was a substring match, so the documented `https://.*\.example\.com` admitted `https://a.example.com.attacker.net` with credentials. The opaque origin `null` is never allowed by an allowlist or pattern. The doc example now uses a single-label pattern (`https://[a-z0-9-]+\.example\.com`). Re-check existing patterns: one that relied on substring matching (for example no scheme) now needs to match the whole origin.
